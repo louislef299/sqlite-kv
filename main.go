@@ -1,18 +1,19 @@
 package main
 
 import (
-	"bytes"
+	"crypto/cipher"
+	"crypto/rand"
 	"database/sql"
-	"io"
+	"fmt"
 	"log"
 	"os"
 
-	"github.com/ProtonMail/go-crypto/openpgp"
+	"golang.org/x/crypto/chacha20poly1305"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 func main() {
-	db, err := NewSecureDB("./config.db", "./keyring.asc")
+	db, err := NewSecureDB("./config.db", "./key.bin")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,12 +32,11 @@ func main() {
 }
 
 type SecureDB struct {
-	db        *sql.DB
-	publicKey *openpgp.Entity
-	secretKey *openpgp.Entity
+	db    *sql.DB
+	aead  cipher.AEAD
 }
 
-func NewSecureDB(dbPath, keyringPath string) (*SecureDB, error) {
+func NewSecureDB(dbPath, keyPath string) (*SecureDB, error) {
 	// Open database
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -52,52 +52,60 @@ func NewSecureDB(dbPath, keyringPath string) (*SecureDB, error) {
 		return nil, err
 	}
 
-	// Load GPG keyring
-	keyringFile, err := os.Open(keyringPath)
+	// Load encryption key (32 bytes for ChaCha20-Poly1305)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read key file: %w", err)
 	}
-	defer keyringFile.Close()
 
-	entityList, err := openpgp.ReadArmoredKeyRing(keyringFile)
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("invalid key size: expected %d bytes, got %d", chacha20poly1305.KeySize, len(key))
+	}
+
+	// Create XChaCha20-Poly1305 AEAD cipher
+	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
 	return &SecureDB{
-		db:        db,
-		publicKey: entityList[0],
-		secretKey: entityList[0],
+		db:   db,
+		aead: aead,
 	}, nil
 }
 
-// Encrypt data with GPG
+// Encrypt data with ChaCha20-Poly1305
 func (s *SecureDB) encrypt(plaintext []byte) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	w, err := openpgp.Encrypt(buf, []*openpgp.Entity{s.publicKey},
-		nil, nil, nil)
-	if err != nil {
-		return nil, err
+	// Generate a random nonce (24 bytes for XChaCha20-Poly1305)
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	_, err = w.Write(plaintext)
-	if err != nil {
-		return nil, err
-	}
-	w.Close()
-
-	return buf.Bytes(), nil
+	// Encrypt and authenticate the plaintext
+	// The result is: nonce || ciphertext || tag
+	ciphertext := s.aead.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
 }
 
-// Decrypt GPG-encrypted data
+// Decrypt ChaCha20-Poly1305 encrypted data
 func (s *SecureDB) decrypt(ciphertext []byte) ([]byte, error) {
-	md, err := openpgp.ReadMessage(bytes.NewReader(ciphertext),
-		openpgp.EntityList{s.secretKey}, nil, nil)
-	if err != nil {
-		return nil, err
+	nonceSize := s.aead.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
 	}
 
-	return io.ReadAll(md.UnverifiedBody)
+	// Extract nonce and ciphertext
+	nonce := ciphertext[:nonceSize]
+	encrypted := ciphertext[nonceSize:]
+
+	// Decrypt and verify the authentication tag
+	plaintext, err := s.aead.Open(nil, nonce, encrypted, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+
+	return plaintext, nil
 }
 
 // Store encrypted value
